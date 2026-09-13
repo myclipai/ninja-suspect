@@ -173,8 +173,14 @@ def download_source(job: dict, workdir: str) -> str:
         cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64")
         if cookies_raw or cookies_b64:
             cookies_path = os.path.join(workdir, "cookies.txt")
-            with open(cookies_path, "wb") as fh:
-                fh.write(cookies_raw.encode() if cookies_raw else base64.b64decode(cookies_b64))
+            if cookies_raw:
+                cookie_bytes = cookies_raw.encode("utf-8", "replace")
+            else:
+                cookie_bytes = base64.b64decode(cookies_b64)
+            # Netscape cookies must be readable as text; replace any invalid bytes.
+            cookie_text = cookie_bytes.decode("utf-8", "replace")
+            with open(cookies_path, "w", encoding="utf-8") as fh:
+                fh.write(cookie_text)
             opts["cookiefile"] = cookies_path
     if platform == "twitch_channel":
         # Most recent VOD from the channel.
