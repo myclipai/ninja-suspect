@@ -464,6 +464,11 @@ def write_captions(words: list[Word], start: float, end: float, colour: str, pos
 def render_clip(video_path: str, workdir: str, job: dict, clip: dict, words: list[Word],
                 width: int, height: int) -> str:
     start, end = float(clip["start"]), float(clip["end"])
+    # Clamp to the real duration so an over-eager timestamp can't kill ffmpeg.
+    meta = probe(video_path)
+    real = float(meta["format"]["duration"])
+    start = min(max(0.0, start), max(0.0, real - 1.0))
+    end = min(max(start + 1.0, end), real)
     duration = end - start
     framing = analyse_framing(video_path, start, end, width, height)
 
@@ -510,14 +515,25 @@ def render_clip(video_path: str, workdir: str, job: dict, clip: dict, words: lis
         filter_complex += ";[v]null[vout]"
 
     out = os.path.join(workdir, f"clip-{uuid.uuid4().hex[:8]}.mp4")
-    run([
-        "ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", video_path,
-        "-filter_complex", filter_complex,
-        "-map", "[vout]", "-map", "0:a?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-r", "30",
-        out,
-    ])
+
+    def encode(filters: str) -> None:
+        run([
+            "ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", video_path,
+            "-filter_complex", filters,
+            "-map", "[vout]", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-r", "30",
+            out,
+        ])
+
+    try:
+        encode(filter_complex)
+    except Exception:
+        if "subtitles" not in filter_complex:
+            raise
+        # Caption burn-in is the fragile part; retry once without it so the
+        # clip still renders instead of failing the whole job.
+        encode(filter_complex.replace(f";[v]subtitles='{escaped}'[vout]", ";[v]null[vout]"))
 
     thumb = os.path.join(workdir, f"thumb-{uuid.uuid4().hex[:8]}.jpg")
     try:
@@ -575,6 +591,7 @@ def process(job: dict):
             progress(job_id, "finding_clips", 100)
 
         rendered = 0
+        first_error = None
         total = len(clips)
         for index, clip in enumerate(clips):
             base = int(index / total * 100)
@@ -603,11 +620,14 @@ def process(job: dict):
                 rendered += 1
             except Cancelled:
                 raise
-            except Exception:  # noqa: BLE001 - one bad clip shouldn't kill the job
+            except Exception as exc:  # noqa: BLE001 - one bad clip shouldn't kill the job
                 print(f"clip {index} failed:\n{traceback.format_exc()}")
+                if first_error is None:
+                    first_error = str(exc).strip().splitlines()[-1][:400]
 
         if rendered == 0:
-            raise UserFacingError("Every clip failed to render. Please try a different video.")
+            detail = f" ({first_error})" if first_error else ""
+            raise UserFacingError(f"Every clip failed to render{detail}. Please try a different video.")
         finish(job_id, "completed")
         print(f"job {job_id}: {rendered}/{total} clips rendered")
 
