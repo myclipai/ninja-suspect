@@ -1,0 +1,15 @@
+app = "myclipai-worker"
+primary_region = "ord"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  APP_URL = "https://myclipai.com"
+  WHISPER_MODEL = "small"
+
+# No [http_service]: this is a polling worker, it serves no traffic.
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "4gb"
