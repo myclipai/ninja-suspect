@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import requests
 
+import importer
+
 APP_URL = os.environ.get("APP_URL", "http://localhost:8080").rstrip("/")
 SECRET = os.environ.get("CLIP_WORKER_SECRET", "")
 WORKER_ID = os.environ.get("FLY_MACHINE_ID") or os.environ.get("HOSTNAME") or f"worker-{uuid.uuid4().hex[:8]}"
@@ -187,11 +189,33 @@ def download_source(job: dict, workdir: str) -> str:
         url = url.rstrip("/") + "/videos"
         opts["playlistend"] = 1
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except Exception as exc:  # noqa: BLE001 - message is shown to the user
-        raise UserFacingError(twitch_friendly_error(str(exc), platform)) from exc
+    def run(options: dict):
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return ydl.extract_info(url, download=True)
+
+    attempts: list[dict] = [opts]
+    if platform == "youtube":
+        # Cookie-free fallbacks: these YouTube clients usually pass without a
+        # signed-in session, which is what public videos need.
+        base = {k: v for k, v in opts.items() if k != "cookiefile"}
+        for clients in (["android", "ios"], ["tv"], ["web_safari"]):
+            variant = dict(base)
+            variant["extractor_args"] = {"youtube": {"player_client": clients}}
+            attempts.append(variant)
+
+    info = None
+    last_error: Exception | None = None
+    for options in attempts:
+        try:
+            info = run(options)
+            last_error = None
+            break
+        except Exception as exc:  # noqa: BLE001 - message is shown to the user
+            last_error = exc
+    if last_error is not None or info is None:
+        raise UserFacingError(twitch_friendly_error(str(last_error), platform)) from last_error
+
+
 
     if info.get("entries"):
         entries = [e for e in info["entries"] if e]
@@ -226,8 +250,8 @@ def twitch_friendly_error(message: str, platform: str) -> str:
         return ("YouTube changed its download protection. The render machine needs its "
                 "downloader updated (yt-dlp + a JavaScript runtime) before this link will work.")
     if "sign in to confirm" in m or "not a bot" in m:
-        return ("YouTube asked us to prove we're not a bot. The saved YouTube session "
-                "has likely expired — re-export the YouTube cookies and try again.")
+        return ("YouTube is blocking downloads from this machine right now. "
+                "Try again in a few minutes, or use a different video link.")
     if "age" in m and "restrict" in m:
         return "That video is age-restricted and can't be downloaded."
     if "geo" in m or "not available in your" in m:
@@ -475,14 +499,24 @@ def render_clip(video_path: str, workdir: str, job: dict, clip: dict, words: lis
     layout = (job.get("layout") or "auto").lower()
     options = job.get("render_options") or {}
     zoom = float(options.get("zoom") or 1)
-    if layout == "gameplay" or layout == "facecam":
+    if layout in ("gameplay", "facecam", "zoomed", "original"):
         framing.facecam = None
     elif layout == "streamer" and not framing.facecam:
         # Asked for the streamer stack but no camera was found: use the top
         # third of the frame as the camera region.
         framing.facecam = (0, 0, width, max(1, height // 3))
 
-    if framing.facecam:
+    if layout == "original":
+        # Full uncropped source, fit to the frame width, centered, with the
+        # empty space filled by a blurred, darkened copy of the video.
+        filter_complex = (
+            f"[0:v]split[bgs][fgs];"
+            f"[bgs]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
+            f"crop={OUT_W}:{OUT_H},boxblur=24:2,eq=brightness=-0.12[bg];"
+            f"[fgs]scale={OUT_W}:-2[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v]"
+        )
+    elif framing.facecam:
         fx, fy, fw, fh = framing.facecam
         cam_h = 620
         play_h = OUT_H - cam_h
@@ -605,15 +639,17 @@ def process(job: dict):
                 path, thumb = render_clip(
                     source, workdir, job, clip, transcript.words, width, height
                 )
-                upload_clip(job_id, path, {
+                clip_meta = {
                     "title": clip.get("title", f"Clip {index + 1}")[:120],
                     "reason": clip.get("reason", "")[:500],
-                    "description": (clip.get("description") or "")[:1000] or None,
                     "layout": (job.get("layout") or "auto"),
                     "score": float(clip.get("score", 70)),
                     "start_seconds": float(clip["start"]),
                     "end_seconds": float(clip["end"]),
-                }, thumb)
+                }
+                if clip.get("description"):
+                    clip_meta["description"] = str(clip["description"])[:1000]
+                upload_clip(job_id, path, clip_meta, thumb)
                 os.remove(path)
                 if thumb and os.path.exists(thumb):
                     os.remove(thumb)
@@ -647,7 +683,20 @@ def main():
     if not SECRET:
         raise SystemExit("CLIP_WORKER_SECRET is not set.")
     print(f"worker {WORKER_ID} polling {APP_URL} every {POLL_SECONDS}s")
+    # Ephemeral disk: clear anything a previous container left behind.
+    importer.cleanup_orphans()
     while True:
+        # Link imports are short, so they get served before render jobs.
+        try:
+            import_job = importer.claim_import()
+        except Exception as exc:  # noqa: BLE001
+            print(f"import claim failed: {exc}")
+            import_job = None
+        if import_job:
+            print(f"claimed import {import_job['id']}")
+            importer.process_import(import_job)
+            continue
+
         try:
             job = claim()
         except Exception as exc:  # noqa: BLE001
