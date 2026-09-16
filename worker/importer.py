@@ -19,12 +19,18 @@ import subprocess
 import tempfile
 import time
 import traceback
+from urllib.parse import urlsplit
 
 import requests
 
 APP_URL = os.environ.get("APP_URL", "http://localhost:8080").rstrip("/")
 SECRET = os.environ.get("CLIP_WORKER_SECRET", "")
 HEADERS = {"x-worker-secret": SECRET}
+
+
+def _is_youtube(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return host.endswith(("youtube.com", "youtu.be", "youtube-nocookie.com"))
 
 TMP_ROOT = os.environ.get("IMPORT_TMP_DIR", tempfile.gettempdir())
 TMP_PREFIX = "myclipai-import-"
@@ -157,11 +163,12 @@ def download_public(url: str, workdir: str, job_id: str,
         "remote_components": ["ejs:github"],
     }
 
-    # Optional residential exit address. YouTube blocks datacenter IP ranges,
-    # so a proxy here makes downloads leave from a normal household address.
-    proxy = os.environ.get("DOWNLOAD_PROXY") or os.environ.get("PROXY_URL")
-    if proxy:
-        opts["proxy"] = proxy
+    # Only YouTube blocks datacenter addresses, so only YouTube leaves through
+    # the metered household exit. Everything else goes direct and costs nothing.
+    if _is_youtube(url):
+        proxy = os.environ.get("DOWNLOAD_PROXY") or os.environ.get("PROXY_URL")
+        if proxy:
+            opts["proxy"] = proxy
 
 
     # Use the same saved YouTube session as the clipping worker when one exists.
