@@ -322,11 +322,11 @@ def process_import(job: dict) -> None:
             )
         video = next((s for s in meta.get("streams", []) if s.get("codec_type") == "video"), {})
 
-        if job.get("editor_clip_id"):
-            caption_words = []
-        else:
-            report(job_id, "transcribing", 82)
-            caption_words = transcribe_words(path, workdir)
+        # Always transcribe the exact file delivered to the editor. For an
+        # edited clip this is already the matching source segment, so these
+        # timestamps begin at zero and stay aligned with preview and export.
+        report(job_id, "transcribing", 82)
+        caption_words = transcribe_words(path, workdir)
 
         report(job_id, "uploading", 85)
         upload(path, job["upload_url"])
