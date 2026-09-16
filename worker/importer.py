@@ -157,6 +157,13 @@ def download_public(url: str, workdir: str, job_id: str,
         "remote_components": ["ejs:github"],
     }
 
+    # Optional residential exit address. YouTube blocks datacenter IP ranges,
+    # so a proxy here makes downloads leave from a normal household address.
+    proxy = os.environ.get("DOWNLOAD_PROXY") or os.environ.get("PROXY_URL")
+    if proxy:
+        opts["proxy"] = proxy
+
+
     # Use the same saved YouTube session as the clipping worker when one exists.
     cookies_raw = os.environ.get("YOUTUBE_COOKIES_TXT")
     cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64")
