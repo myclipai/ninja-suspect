@@ -1,14 +1,16 @@
 """
 Link import jobs.
 
-Downloads a *public* YouTube video with yt-dlp (no cookies, no sign-in) into
-the container's ephemeral /tmp, checks it against the editor's limits, pushes
-the MP4 to private storage with a one-time signed upload URL and then deletes
-every temp file it made. Nothing is expected to survive a restart.
+Downloads a YouTube video with yt-dlp into the container's ephemeral /tmp,
+checks it against the editor's limits, pushes the MP4 to private storage with
+a one-time signed upload URL and then deletes every temp file it made. It uses
+the same saved YouTube session as the clipping worker when one is configured,
+and falls back to cookie-free clients otherwise. Nothing survives a restart.
 """
 
 from __future__ import annotations
 
+import base64
 import glob
 import json
 import os
@@ -153,8 +155,19 @@ def download_public(url: str, workdir: str, job_id: str,
         "concurrent_fragment_downloads": 4,
         "progress_hooks": [hook],
         "remote_components": ["ejs:github"],
-        # Public videos only: never attach cookies or credentials here.
     }
+
+    # Use the same saved YouTube session as the clipping worker when one exists.
+    cookies_raw = os.environ.get("YOUTUBE_COOKIES_TXT")
+    cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64")
+    if cookies_raw or cookies_b64:
+        cookies_path = os.path.join(workdir, "cookies.txt")
+        cookie_bytes = (
+            cookies_raw.encode("utf-8", "replace") if cookies_raw else base64.b64decode(cookies_b64)
+        )
+        with open(cookies_path, "w", encoding="utf-8") as fh:
+            fh.write(cookie_bytes.decode("utf-8", "replace"))
+        opts["cookiefile"] = cookies_path
 
     if segment_start is not None and segment_end is not None:
         if segment_end <= segment_start or segment_end - segment_start > MAX_SECONDS:
@@ -167,8 +180,8 @@ def download_public(url: str, workdir: str, job_id: str,
         }]
         opts["force_keyframes_at_cuts"] = True
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+    def attempt(options: dict) -> None:
+        with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
             duration = float((info or {}).get("duration") or 0)
             if duration <= 0:
@@ -179,10 +192,34 @@ def download_public(url: str, workdir: str, job_id: str,
                     f"{MAX_SECONDS // 60} minutes."
                 )
             ydl.download([url])
-    except ImportError_:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise ImportError_(friendly(str(exc))) from exc
+
+    # Try the saved session first, then cookie-free clients that usually pass
+    # for public videos.
+    attempts: list[dict] = [opts]
+    base = {k: v for k, v in opts.items() if k != "cookiefile"}
+    for clients in (["android", "ios"], ["tv"], ["web_safari"]):
+        variant = dict(base)
+        variant["extractor_args"] = {"youtube": {"player_client": clients}}
+        attempts.append(variant)
+
+    last_error: Exception | None = None
+    for options in attempts:
+        try:
+            attempt(options)
+            last_error = None
+            break
+        except ImportError_:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            # Clear any partial files before the next attempt.
+            for leftover in glob.glob(os.path.join(workdir, "source.*")):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+    if last_error is not None:
+        raise ImportError_(friendly(str(last_error))) from last_error
 
     for name in sorted(os.listdir(workdir)):
         if name.startswith("source."):
