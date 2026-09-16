@@ -197,10 +197,14 @@ def download_public(url: str, workdir: str, job_id: str,
     # for public videos.
     attempts: list[dict] = [opts]
     base = {k: v for k, v in opts.items() if k != "cookiefile"}
-    for clients in (["android", "ios"], ["tv"], ["web_safari"]):
+    for clients in (["android_vr"], ["tv"], ["ios"], ["mweb"], ["web_safari"], ["web_embedded"]):
         variant = dict(base)
         variant["extractor_args"] = {"youtube": {"player_client": clients}}
         attempts.append(variant)
+        if "cookiefile" in opts:
+            with_cookies = dict(variant)
+            with_cookies["cookiefile"] = opts["cookiefile"]
+            attempts.append(with_cookies)
 
     last_error: Exception | None = None
     for options in attempts:
