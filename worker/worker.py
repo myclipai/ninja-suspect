@@ -196,16 +196,38 @@ def download_source(job: dict, workdir: str) -> str:
     attempts: list[dict] = [opts]
     if platform == "youtube":
         # Cookie-free fallbacks: these YouTube clients usually pass without a
-        # signed-in session, which is what public videos need.
+        # signed-in session, which is what public videos need. The saved session
+        # is also retried with alternative clients, because the bot check is
+        # tied to the client YouTube thinks is asking.
         base = {k: v for k, v in opts.items() if k != "cookiefile"}
-        for clients in (["android", "ios"], ["tv"], ["web_safari"]):
+        for clients in (
+            ["android_vr"],
+            ["tv"],
+            ["ios"],
+            ["mweb"],
+            ["web_safari"],
+            ["web_embedded"],
+        ):
             variant = dict(base)
             variant["extractor_args"] = {"youtube": {"player_client": clients}}
             attempts.append(variant)
+            if "cookiefile" in opts:
+                with_cookies = dict(variant)
+                with_cookies["cookiefile"] = opts["cookiefile"]
+                attempts.append(with_cookies)
 
     info = None
     last_error: Exception | None = None
-    for options in attempts:
+    for index, options in enumerate(attempts):
+        if index:
+            # Short backoff: YouTube's block often clears between clients.
+            time.sleep(min(2 * index, 8))
+            for leftover in os.listdir(workdir):
+                if leftover.startswith("source."):
+                    try:
+                        os.remove(os.path.join(workdir, leftover))
+                    except OSError:
+                        pass
         try:
             info = run(options)
             last_error = None
