@@ -30,7 +30,8 @@ SECRET = os.environ.get("CLIP_WORKER_SECRET", "")
 WORKER_ID = os.environ.get("FLY_MACHINE_ID") or os.environ.get("HOSTNAME") or f"worker-{uuid.uuid4().hex[:8]}"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "10"))
-MAX_SOURCE_SECONDS = int(os.environ.get("MAX_SOURCE_SECONDS", "14400"))  # 4 hours
+MAX_SOURCE_SECONDS = int(os.environ.get("MAX_SOURCE_SECONDS", "5400"))  # 90 minutes
+WINDOW_PAD_SECONDS = float(os.environ.get("CLIP_WINDOW_PAD_SECONDS", "8"))
 
 OUT_W, OUT_H = 1080, 1920
 HEADERS = {"x-worker-secret": SECRET}
@@ -65,10 +66,13 @@ def progress(job_id: str, stage: str, pct: int, **extra):
         pass
 
 
-def finish(job_id: str, status: str, error: str | None = None):
+def finish(job_id: str, status: str, error: str | None = None,
+           downloaded_bytes: int | None = None):
     body = {"job_id": job_id, "status": status}
     if error:
         body["error"] = error[:1900]
+    if downloaded_bytes is not None:
+        body["downloaded_bytes"] = int(downloaded_bytes)
     requests.post(api("finish"), headers=HEADERS, json=body, timeout=60)
 
 
@@ -136,32 +140,23 @@ def probe(path: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# 1. download
+# 1. reading the source with as few paid bytes as possible
 # --------------------------------------------------------------------------- #
-def download_source(job: dict, workdir: str) -> str:
-    import yt_dlp
+VIDEO_FORMAT = (
+    "bestvideo[height<=1080][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]"
+    "/best[height<=1080][vcodec^=avc1][ext=mp4]"
+    "/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+    "/best[height<=1080]"
+)
+AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio/best"
+PLAYER_CLIENTS = (["android_vr"], ["tv"], ["ios"], ["mweb"], ["web_safari"], ["web_embedded"])
 
+
+def link_setup(job: dict, workdir: str) -> tuple[str, dict]:
+    """yt-dlp settings shared by every link download a job makes."""
     url = job["source_url"]
-    platform = job["platform"]
-    target = os.path.join(workdir, "source.%(ext)s")
-
-    # Uploaded files come straight from private storage over a signed link.
-    direct = job.get("source_download_url")
-    if direct:
-        path = os.path.join(workdir, "source.mp4")
-        with requests.get(direct, stream=True, timeout=1800) as resp:
-            if not resp.ok:
-                raise UserFacingError("That uploaded file could not be read any more.")
-            with open(path, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    fh.write(chunk)
-        if os.path.getsize(path) == 0:
-            raise UserFacingError("That uploaded file is empty.")
-        return path
-
+    platform = job.get("platform") or ""
     opts = {
-        "outtmpl": target,
-        "format": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/best",
         "merge_output_format": "mp4",
         "noprogress": True,
         "quiet": True,
@@ -170,100 +165,203 @@ def download_source(job: dict, workdir: str) -> str:
         # YouTube serves a JS challenge; allow yt-dlp to fetch its solver.
         "remote_components": ["ejs:github"],
     }
-    # Optional residential exit address. YouTube blocks datacenter IP ranges,
-    # so a proxy here makes downloads leave from a normal household address.
-    proxy = os.environ.get("DOWNLOAD_PROXY") or os.environ.get("PROXY_URL")
-    if proxy:
-        opts["proxy"] = proxy
-
     if platform == "youtube":
+        # Only YouTube blocks datacenter addresses, so only its downloads leave
+        # through the metered household exit. Twitch, Kick and uploads go
+        # direct and cost nothing.
+        proxy = os.environ.get("DOWNLOAD_PROXY") or os.environ.get("PROXY_URL")
+        if proxy:
+            opts["proxy"] = proxy
         cookies_raw = os.environ.get("YOUTUBE_COOKIES_TXT")
         cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64")
         if cookies_raw or cookies_b64:
             cookies_path = os.path.join(workdir, "cookies.txt")
-            if cookies_raw:
-                cookie_bytes = cookies_raw.encode("utf-8", "replace")
-            else:
-                cookie_bytes = base64.b64decode(cookies_b64)
+            cookie_bytes = (
+                cookies_raw.encode("utf-8", "replace") if cookies_raw else base64.b64decode(cookies_b64)
+            )
             # Netscape cookies must be readable as text; replace any invalid bytes.
-            cookie_text = cookie_bytes.decode("utf-8", "replace")
             with open(cookies_path, "w", encoding="utf-8") as fh:
-                fh.write(cookie_text)
+                fh.write(cookie_bytes.decode("utf-8", "replace"))
             opts["cookiefile"] = cookies_path
     if platform == "twitch_channel":
         # Most recent VOD from the channel.
         url = url.rstrip("/") + "/videos"
         opts["playlistend"] = 1
-
-    def run(options: dict):
-        with yt_dlp.YoutubeDL(options) as ydl:
-            return ydl.extract_info(url, download=True)
-
-    attempts: list[dict] = [opts]
-    if platform == "youtube":
-        # Cookie-free fallbacks: these YouTube clients usually pass without a
-        # signed-in session, which is what public videos need. The saved session
-        # is also retried with alternative clients, because the bot check is
-        # tied to the client YouTube thinks is asking.
-        base = {k: v for k, v in opts.items() if k != "cookiefile"}
-        for clients in (
-            ["android_vr"],
-            ["tv"],
-            ["ios"],
-            ["mweb"],
-            ["web_safari"],
-            ["web_embedded"],
-        ):
-            variant = dict(base)
-            variant["extractor_args"] = {"youtube": {"player_client": clients}}
-            attempts.append(variant)
-            if "cookiefile" in opts:
-                with_cookies = dict(variant)
-                with_cookies["cookiefile"] = opts["cookiefile"]
-                attempts.append(with_cookies)
-
-    info = None
-    last_error: Exception | None = None
-    for index, options in enumerate(attempts):
-        if index:
-            # Short backoff: YouTube's block often clears between clients.
-            time.sleep(min(2 * index, 8))
-            for leftover in os.listdir(workdir):
-                if leftover.startswith("source."):
-                    try:
-                        os.remove(os.path.join(workdir, leftover))
-                    except OSError:
-                        pass
-        try:
-            info = run(options)
-            last_error = None
-            break
-        except Exception as exc:  # noqa: BLE001 - message is shown to the user
-            last_error = exc
-    if last_error is not None or info is None:
-        raise UserFacingError(twitch_friendly_error(str(last_error), platform)) from last_error
+    return url, opts
 
 
+class JobSource:
+    """Where a job's video comes from, and the least of it we have to fetch.
 
-    if info.get("entries"):
-        entries = [e for e in info["entries"] if e]
-        if not entries:
-            raise UserFacingError("That Twitch channel has no videos we can use.")
-        info = entries[0]
+    Uploaded files and saved windows arrive as a file we already own, so
+    nothing metered is spent on them. A link is read in two passes — audio only
+    to pick the moments, then just the chosen windows to render — so a 24
+    minute source pays for about a minute of picture instead of all of it.
+    """
 
-    duration = float(info.get("duration") or 0)
-    if duration <= 0:
-        raise UserFacingError("We couldn't read that video's length — it may still be live.")
-    if duration > MAX_SOURCE_SECONDS:
+    def __init__(self, job: dict, workdir: str):
+        self.job = job
+        self.workdir = workdir
+        self.local: str | None = None
+        self.opts: dict = {}
+        self.url = job["source_url"]
+        self.duration = 0.0
+        self.used = 0
+        self.offset = float((job.get("render_options") or {}).get("window_offset_seconds") or 0)
+        self._seen: dict[str, int] = {}
+
+    # -- set up ----------------------------------------------------------
+    def prepare(self) -> None:
+        direct = self.job.get("source_download_url")
+        if direct:
+            self.local = self._fetch_whole(direct)
+        else:
+            self.url, self.opts = link_setup(self.job, self.workdir)
+
+    def _fetch_whole(self, url: str) -> str:
+        """Reads a file we already keep in private storage: no metered bytes."""
+        path = os.path.join(self.workdir, "stored.mp4")
+        with requests.get(url, stream=True, timeout=1800) as resp:
+            if not resp.ok:
+                raise UserFacingError("The copy of that video we kept can't be read any more.")
+            with open(path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    fh.write(chunk)
+        if os.path.getsize(path) == 0:
+            raise UserFacingError("That file is empty.")
+        return path
+
+    # -- metadata --------------------------------------------------------
+    def read_duration(self) -> tuple[float, str | None]:
+        """How long the source is, without downloading the picture."""
+        if self.local:
+            self.duration = float(probe(self.local)["format"]["duration"])
+            return self.duration, None
+
+        info = self._ladder(lambda _o: None, download=False)
+        duration = float(info.get("duration") or 0)
+        if duration <= 0:
+            raise UserFacingError("We couldn't read that video's length — it may still be live.")
+        if duration > MAX_SOURCE_SECONDS:
+            raise UserFacingError(
+                f"That video is {int(duration / 60)} minutes long. Please use one under "
+                f"{MAX_SOURCE_SECONDS // 60} minutes."
+            )
+        self.duration = duration
+        return duration, info.get("title")
+
+    # -- audio -----------------------------------------------------------
+    def audio_file(self) -> str:
+        """Something ffmpeg can pull sound out of, at the cheapest price."""
+        if self.local:
+            return self.local
+
+        def mutate(options: dict) -> None:
+            options["outtmpl"] = os.path.join(self.workdir, "audio.%(ext)s")
+            options["format"] = AUDIO_FORMAT
+
+        self._ladder(mutate, download=True)
+        return self._claim("audio.")
+
+    # -- picture ---------------------------------------------------------
+    def window(self, start: float, end: float) -> tuple[str, float]:
+        """Fetches this moment, plus a little room to breathe, and returns the
+        file together with the source time its first second sits at."""
+        if self.local:
+            return self.local, self.offset
+
+        lo = max(0.0, start - WINDOW_PAD_SECONDS)
+        hi = min(self.duration or end + WINDOW_PAD_SECONDS, end + WINDOW_PAD_SECONDS)
+
+        def mutate(options: dict) -> None:
+            options["outtmpl"] = os.path.join(self.workdir, "window.%(ext)s")
+            options["format"] = VIDEO_FORMAT
+            options["download_ranges"] = lambda _info, _ydl: [{"start_time": lo, "end_time": hi}]
+            options["force_keyframes_at_cuts"] = True
+
+        self._ladder(mutate, download=True)
+        return self._claim("window."), lo
+
+    # -- the download ladder ---------------------------------------------
+    def _ladder(self, mutate, download: bool) -> dict:
+        """Tries the saved session, then cookie-free clients, until one works."""
+        base = dict(self.opts)
+        variants: list[dict] = [base]
+        if (self.job.get("platform") or "") == "youtube":
+            # Cookie-free fallbacks: these YouTube clients usually pass without
+            # a signed-in session, which is what public videos need. The saved
+            # session is also retried with alternative clients, because the bot
+            # check is tied to the client YouTube thinks is asking.
+            without = {k: v for k, v in base.items() if k != "cookiefile"}
+            for clients in PLAYER_CLIENTS:
+                variant = dict(without)
+                variant["extractor_args"] = {"youtube": {"player_client": clients}}
+                variants.append(variant)
+                if "cookiefile" in base:
+                    with_cookies = dict(variant)
+                    with_cookies["cookiefile"] = base["cookiefile"]
+                    variants.append(with_cookies)
+
+        last: Exception | None = None
+        for index, options in enumerate(variants):
+            if index:
+                # Short backoff: YouTube's block often clears between clients.
+                time.sleep(min(2 * index, 8))
+                self._clear_partials()
+            mutate(options)
+            try:
+                return self._run(options, download)
+            except Exception as exc:  # noqa: BLE001 - the message is shown to the user
+                last = exc
         raise UserFacingError(
-            f"That video is {int(duration / 3600)} hours long. Please use one under "
-            f"{MAX_SOURCE_SECONDS // 3600} hours."
-        )
+            twitch_friendly_error(str(last), self.job.get("platform") or "")
+        ) from last
 
-    for name in os.listdir(workdir):
-        if name.startswith("source."):
-            return os.path.join(workdir, name)
-    raise UserFacingError("The video downloaded but no file was produced.")
+    def _run(self, options: dict, download: bool) -> dict:
+        import yt_dlp
+
+        options["progress_hooks"] = [self._count_bytes]
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(self.url, download=download)
+        if info.get("entries"):
+            entries = [e for e in info["entries"] if e]
+            if not entries:
+                raise UserFacingError("That Twitch channel has no videos we can use.")
+            info = entries[0]
+        return info
+
+    def _count_bytes(self, state: dict) -> None:
+        """Adds up what actually crossed the metered connection."""
+        name = state.get("filename") or "?"
+        done = int(state.get("downloaded_bytes") or 0)
+        if done > self._seen.get(name, 0):
+            self.used += done - self._seen.get(name, 0)
+            self._seen[name] = done
+
+    def _clear_partials(self) -> None:
+        for name in os.listdir(self.workdir):
+            if name.startswith(("source.", "audio.", "window.", "stored.")):
+                try:
+                    os.remove(os.path.join(self.workdir, name))
+                except OSError:
+                    pass
+
+    def _claim(self, prefix: str) -> str:
+        """Names the file a download just produced so the next one starts clean."""
+        made = [os.path.join(self.workdir, n) for n in os.listdir(self.workdir)
+                if n.startswith(prefix)]
+        if not made:
+            raise UserFacingError("The video downloaded but no file was produced.")
+        newest = max(made, key=os.path.getmtime)
+        final = os.path.join(self.workdir, f"{prefix[:-1]}-{uuid.uuid4().hex[:8]}.mp4")
+        os.rename(newest, final)
+        for leftover in made:
+            if leftover != newest and os.path.isfile(leftover):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+        return final
 
 
 def twitch_friendly_error(message: str, platform: str) -> str:
@@ -324,19 +422,23 @@ def transcribe(video_path: str, workdir: str) -> Transcript:
     return result
 
 
-def audio_visual_signals(video_path: str, workdir: str, duration: float) -> list[dict]:
-    """Loudness, scene-change count and face presence per 30 second window."""
-    import cv2
+def audio_signals(workdir: str, transcript: Transcript, duration: float) -> list[dict]:
+    """Loudness and speech count per 30 second window, read off the audio that
+    transcription already left on disk.
+
+    Only the sound is fetched before moments are chosen, so these signals come
+    from a file that costs about a megabyte a minute instead of the whole
+    picture. They still point the AI at the loud, busy parts of a video.
+    """
+    import wave
 
     window = 30.0
-    windows = max(1, int(duration // window))
+    windows = max(1, int(duration // window) + 1)
     audio = os.path.join(workdir, "audio.wav")
     signals: list[dict] = []
 
     loud = []
     try:
-        import wave
-
         with wave.open(audio, "rb") as wf:
             rate = wf.getframerate()
             frames = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32)
@@ -347,28 +449,19 @@ def audio_visual_signals(video_path: str, workdir: str, duration: float) -> list
     except Exception:  # noqa: BLE001 - signals are best effort
         loud = [0.0] * windows
 
-    cap = cv2.VideoCapture(video_path)
-    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    prev = None
+    spoken = [0] * windows
+    for word in transcript.words:
+        idx = int(word.start // window)
+        if 0 <= idx < windows:
+            spoken[idx] += 1
+
     for i in range(windows):
-        cap.set(cv2.CAP_PROP_POS_MSEC, (i * window + window / 2) * 1000)
-        ok, frame = cap.read()
-        faces, cuts = 0, 0
-        if ok:
-            small = cv2.resize(frame, (480, 270))
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            faces = len(cascade.detectMultiScale(gray, 1.2, 5, minSize=(24, 24)))
-            if prev is not None:
-                cuts = int(np.mean(cv2.absdiff(gray, prev)) > 18)
-            prev = gray
         signals.append({
             "start": i * window,
-            "end": (i + 1) * window,
+            "end": min(duration, (i + 1) * window),
             "loudness": round(loud[i] if i < len(loud) else 0.0, 2),
-            "scene_changes": cuts,
-            "faces": faces,
+            "words": spoken[i],
         })
-    cap.release()
     return signals
 
 
@@ -514,14 +607,18 @@ def write_captions(words: list[Word], start: float, end: float, colour: str, pos
 # 6. render one clip
 # --------------------------------------------------------------------------- #
 def render_clip(video_path: str, workdir: str, job: dict, clip: dict, words: list[Word],
-                width: int, height: int) -> str:
-    start, end = float(clip["start"]), float(clip["end"])
+                width: int, height: int, offset: float = 0.0) -> tuple[str, str | None]:
+    """Renders one clip. `offset` is the source time the file's first second
+    sits at, so a short window file and a whole source are handled the same."""
+    start, end = float(clip["start"]) - offset, float(clip["end"]) - offset
     # Clamp to the real duration so an over-eager timestamp can't kill ffmpeg.
     meta = probe(video_path)
     real = float(meta["format"]["duration"])
     start = min(max(0.0, start), max(0.0, real - 1.0))
     end = min(max(start + 1.0, end), real)
     duration = end - start
+    if offset:
+        words = [Word(w.start - offset, w.end - offset, w.text) for w in words]
     framing = analyse_framing(video_path, start, end, width, height)
 
     layout = (job.get("layout") or "auto").lower()
@@ -611,24 +708,78 @@ def render_clip(video_path: str, workdir: str, job: dict, clip: dict, words: lis
 # --------------------------------------------------------------------------- #
 # job pipeline
 # --------------------------------------------------------------------------- #
+def store_window(job_id: str, path: str) -> str | None:
+    """Keeps a paid-for window in private storage so it is never bought twice.
+
+    Best effort: a window that fails to store only means the next re-render
+    pays for it again, so it must never fail the job that is already running.
+    """
+    try:
+        with open(path, "rb") as fh:
+            r = requests.post(
+                api("window"),
+                headers=HEADERS,
+                files={"job_id": (None, job_id), "file": (os.path.basename(path), fh, "video/mp4")},
+                timeout=900,
+            )
+        if r.ok:
+            return r.json().get("path")
+        print(f"window store failed [{r.status_code}]: {r.text[:200]}")
+    except (requests.RequestException, OSError) as exc:
+        print(f"window store failed: {exc}")
+    return None
+
+
+def render_one(source: JobSource, workdir: str, job: dict, clip: dict, words: list[Word]):
+    """Fetches just this moment and renders it.
+
+    Returns the finished file, its poster frame, and the window it came from so
+    the app can reuse that window for a later re-render or editor open.
+    """
+    file, window_start = source.window(float(clip["start"]), float(clip["end"]))
+    meta = probe(file)
+    stream = next((s for s in meta["streams"] if s["codec_type"] == "video"), None)
+    if not stream:
+        raise UserFacingError("That file has no video track.")
+    width, height = int(stream["width"]), int(stream["height"])
+    window_seconds = float(meta["format"]["duration"])
+
+    path, thumb = render_clip(file, workdir, job, clip, words, width, height, window_start)
+
+    if source.local:
+        # Nothing metered was spent here. A reused window is handed back so the
+        # clip keeps pointing at the copy we already own; an uploaded source is
+        # already stored whole, so there is nothing extra to keep.
+        if job.get("source_kind") == "window" and job.get("source_storage_path"):
+            return path, thumb, (
+                job["source_storage_path"],
+                window_start,
+                window_start + window_seconds,
+                job.get("source_expires_at"),
+            )
+        return path, thumb, (None, None, None, None)
+
+    stored = store_window(job["id"], file)
+    return path, thumb, (stored, window_start, window_start + window_seconds, None)
+
+
 def process(job: dict):
     job_id = job["id"]
     workdir = tempfile.mkdtemp(prefix="clipjob-")
+    source = JobSource(job, workdir)
     try:
         progress(job_id, "importing", 10)
-        source = download_source(job, workdir)
-        meta = probe(source)
-        stream = next((s for s in meta["streams"] if s["codec_type"] == "video"), None)
-        if not stream:
-            raise UserFacingError("That file has no video track.")
-        width, height = int(stream["width"]), int(stream["height"])
-        duration = float(meta["format"]["duration"])
+        source.prepare()
+        duration, title = source.read_duration()
+        if title:
+            progress(job_id, "importing", 70, title=title[:300])
         progress(job_id, "importing", 100, duration_seconds=duration)
 
-        progress(job_id, "analyzing", 15)
-        transcript = transcribe(source, workdir)
-        progress(job_id, "analyzing", 70)
-        signals = audio_visual_signals(source, workdir, duration)
+        # Picking moments only needs the sound track, which costs about a
+        # megabyte a minute, so the picture is never downloaded up front.
+        progress(job_id, "analyzing", 25)
+        transcript = transcribe(source.audio_file(), workdir)
+        signals = audio_signals(workdir, transcript, duration)
         progress(job_id, "analyzing", 100)
 
         options = job.get("render_options") or {}
@@ -664,9 +815,8 @@ def process(job: dict):
                 progress(job_id, "captioning", min(99, base + step // 2))
             progress(job_id, "rendering", min(99, base + step))
             try:
-                path, thumb = render_clip(
-                    source, workdir, job, clip, transcript.words, width, height
-                )
+                path, thumb, window = render_one(source, workdir, job, clip, transcript.words)
+                window_path, window_start, window_end, window_expiry = window
                 clip_meta = {
                     "title": clip.get("title", f"Clip {index + 1}")[:120],
                     "reason": clip.get("reason", "")[:500],
@@ -674,6 +824,10 @@ def process(job: dict):
                     "score": float(clip.get("score", 70)),
                     "start_seconds": float(clip["start"]),
                     "end_seconds": float(clip["end"]),
+                    "window_storage_path": window_path,
+                    "window_start_seconds": window_start,
+                    "window_end_seconds": window_end,
+                    "window_expires_at": window_expiry,
                 }
                 if clip.get("description"):
                     clip_meta["description"] = str(clip["description"])[:1000]
@@ -692,17 +846,18 @@ def process(job: dict):
         if rendered == 0:
             detail = f" ({first_error})" if first_error else ""
             raise UserFacingError(f"Every clip failed to render{detail}. Please try a different video.")
-        finish(job_id, "completed")
-        print(f"job {job_id}: {rendered}/{total} clips rendered")
+        finish(job_id, "completed", downloaded_bytes=source.used)
+        print(f"job {job_id}: {rendered}/{total} clips rendered, {source.used / 1024 / 1024:.0f} MB fetched")
 
     except Cancelled:
-        finish(job_id, "cancelled", "Cancelled.")
+        finish(job_id, "cancelled", "Cancelled.", downloaded_bytes=source.used)
         print(f"job {job_id} cancelled by the user")
     except UserFacingError as exc:
-        finish(job_id, "failed", str(exc))
+        finish(job_id, "failed", str(exc), downloaded_bytes=source.used)
     except Exception:  # noqa: BLE001
         print(traceback.format_exc())
-        finish(job_id, "failed", "Something went wrong while processing this video. Please try again.")
+        finish(job_id, "failed", "Something went wrong while processing this video. Please try again.",
+               downloaded_bytes=source.used)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
