@@ -707,12 +707,36 @@ def process(job: dict):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def check_proxy() -> None:
+    """Report whether the optional download proxy actually works, at startup.
+
+    A typo or dead proxy otherwise shows up as a confusing "YouTube is
+    blocking" error on every job. This prints the truth in the logs instead.
+    """
+    proxy = os.environ.get("DOWNLOAD_PROXY") or os.environ.get("PROXY_URL")
+    if not proxy:
+        print("download proxy: none set, downloading directly")
+        return
+    shown = proxy.split("@")[-1] if "@" in proxy else proxy
+    try:
+        r = requests.get(
+            "https://www.youtube.com/generate_204",
+            proxies={"http": proxy, "https": proxy},
+            timeout=20,
+        )
+        print(f"download proxy {shown}: reachable (HTTP {r.status_code})")
+    except Exception as exc:  # noqa: BLE001
+        print(f"download proxy {shown}: FAILED - {exc}. Check DOWNLOAD_PROXY.")
+
+
 def main():
     if not SECRET:
         raise SystemExit("CLIP_WORKER_SECRET is not set.")
     print(f"worker {WORKER_ID} polling {APP_URL} every {POLL_SECONDS}s")
     # Ephemeral disk: clear anything a previous container left behind.
     importer.cleanup_orphans()
+    check_proxy()
+
     while True:
         # Link imports are short, so they get served before render jobs.
         try:
