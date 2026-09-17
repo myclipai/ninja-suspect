@@ -13,7 +13,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY worker.py importer.py ./
+COPY worker.py importer.py vidkraken.py ./
 
 ENV WHISPER_MODEL=small
 ENV PYTHONUNBUFFERED=1
