@@ -35,6 +35,9 @@ WORKER_ID = os.environ.get("FLY_MACHINE_ID") or os.environ.get("HOSTNAME") or f"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "10"))
 MAX_SOURCE_SECONDS = int(os.environ.get("MAX_SOURCE_SECONDS", "5400"))  # 90 minutes
+# A sound track is roughly a megabyte a minute, so anything much bigger than
+# this means the video is longer than we can work with: stop paying for it.
+MAX_AUDIO_BYTES = int(os.environ.get("MAX_AUDIO_BYTES", "160000000"))
 WINDOW_PAD_SECONDS = float(os.environ.get("CLIP_WINDOW_PAD_SECONDS", "8"))
 
 OUT_W, OUT_H = 1080, 1920
@@ -210,9 +213,11 @@ class JobSource:
         self.opts: dict = {}
         self.url = job["source_url"]
         self.duration = 0.0
+        self.duration_known = False
         self.used = 0
         self.offset = float((job.get("render_options") or {}).get("window_offset_seconds") or 0)
         self._seen: dict[str, int] = {}
+        self._audio: str | None = None
         # YouTube goes through the paid download service when one is configured.
         self.kraken = (job.get("platform") or "") == "youtube" and vidkraken.enabled()
 
@@ -239,41 +244,72 @@ class JobSource:
 
     # -- metadata --------------------------------------------------------
     def read_duration(self) -> tuple[float, str | None]:
-        """How long the source is, without downloading the picture."""
-        if self.local:
-            self.duration = float(probe(self.local)["format"]["duration"])
-            return self.duration, None
+        """How long the source is, without downloading the picture.
 
-        info: dict = {}
+        A length of 0 means the metadata we were handed didn't carry one. The
+        caller then reads the exact length off the audio track it needs anyway,
+        rather than giving up on a video that is perfectly downloadable.
+        """
+        if self.local:
+            return self._cap(self._probe(self.local)), None
+
         if self.kraken:
             try:
                 info = vidkraken.info(self.url)
             except vidkraken.VidKrakenError as exc:
-                print(f"vidkraken info failed, falling back to yt-dlp: {exc}")
-                self.kraken = False
-        if not info:
-            info = self._ladder(lambda _o: None, download=False)
+                print(f"vidkraken info failed, reading the length off the audio instead: {exc}")
+                return 0.0, None
+            title = info.get("title")
+            duration = float(info.get("duration") or 0)
+            if duration <= 0:
+                print(
+                    "vidkraken info carried no length "
+                    f"({vidkraken.describe(info.get('raw') or {})})"
+                )
+                return 0.0, title
+            return self._cap(duration), title
+
+        info = self._ladder(lambda _o: None, download=False)
         duration = float(info.get("duration") or 0)
         if duration <= 0:
             raise UserFacingError("We couldn't read that video's length — it may still be live.")
+        return self._cap(duration), info.get("title")
+
+    def duration_from_audio(self, path: str) -> float:
+        """The exact length, read off a sound track we already paid for."""
+        return self._cap(self._probe(path))
+
+    def _cap(self, duration: float) -> float:
+        """Records the length, refusing anything longer than we agree to take."""
         if duration > MAX_SOURCE_SECONDS:
             raise UserFacingError(
                 f"That video is {int(duration / 60)} minutes long. Please use one under "
                 f"{MAX_SOURCE_SECONDS // 60} minutes."
             )
         self.duration = duration
-        return duration, info.get("title")
+        self.duration_known = True
+        return duration
+
+    @staticmethod
+    def _probe(path: str) -> float:
+        return float(probe(path)["format"]["duration"])
 
     # -- audio -----------------------------------------------------------
     def audio_file(self) -> str:
-        """Something ffmpeg can pull sound out of, at the cheapest price."""
+        """Something ffmpeg can pull sound out of, at the cheapest price.
+
+        Kept after the first call so a job never pays for the same audio twice.
+        """
         if self.local:
             return self.local
+        if self._audio and os.path.exists(self._audio):
+            return self._audio
 
         if self.kraken:
             path = os.path.join(self.workdir, f"audio-{uuid.uuid4().hex[:8]}.m4a")
             try:
-                vidkraken.fetch(self.url, "audio", path, on_bytes=self._add_bytes)
+                vidkraken.fetch(self.url, "audio", path, on_bytes=self._meter)
+                self._audio = path
                 return path
             except vidkraken.VidKrakenError as exc:
                 print(f"vidkraken audio failed, falling back to yt-dlp: {exc}")
@@ -284,7 +320,17 @@ class JobSource:
             options["format"] = AUDIO_FORMAT
 
         self._ladder(mutate, download=True)
-        return self._claim("audio.")
+        self._audio = self._claim("audio.")
+        return self._audio
+
+    def _meter(self, count: int) -> None:
+        """Counts bytes and stops a runaway sound track before it gets costly."""
+        self._add_bytes(count)
+        if self.used > MAX_AUDIO_BYTES:
+            raise UserFacingError(
+                "That video is too long for us to work with. Please use one under "
+                f"{MAX_SOURCE_SECONDS // 60} minutes."
+            )
 
     # -- picture ---------------------------------------------------------
     def window(self, start: float, end: float) -> tuple[str, float]:
@@ -825,6 +871,10 @@ def process(job: dict):
         duration, title = source.read_duration()
         if title:
             progress(job_id, "importing", 70, title=title[:300])
+        if not source.duration_known:
+            # The metadata had no length; the sound track reveals it exactly and
+            # is needed anyway, so nothing extra is spent finding it out.
+            duration = source.duration_from_audio(source.audio_file())
         progress(job_id, "importing", 100, duration_seconds=duration)
 
         # Picking moments only needs the sound track, which costs about a
