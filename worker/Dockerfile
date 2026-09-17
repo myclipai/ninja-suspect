@@ -13,7 +13,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY worker.py importer.py vidkraken.py ./
+COPY worker.py importer.py ./
+
+# Fail the image build immediately if its Python modules cannot load. This
+# prevents Railway from deploying a container that enters a restart loop.
+RUN python -c "import importer; import worker; print(importer.vidkraken.status_line())"
 
 ENV WHISPER_MODEL=small
 ENV PYTHONUNBUFFERED=1
