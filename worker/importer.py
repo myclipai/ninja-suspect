@@ -29,6 +29,14 @@ class _VidKrakenError(Exception):
     """A VidKraken failure that permits the existing yt-dlp fallback."""
 
 
+# VidKraken has renamed its length field before, so try the most specific names
+# first and fall back to anything that merely looks like a duration.
+_DURATION_TIERS = (
+    ("durationseconds", "lengthseconds", "durationinseconds"),
+    ("duration", "length"),
+)
+
+
 class _VidKrakenClient:
     """Self-contained VidKraken client.
 
@@ -62,6 +70,121 @@ class _VidKrakenClient:
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return fallback
+
+    # -- response field discovery ------------------------------------------
+    # VidKraken describes its payloads in prose rather than a pinned schema and
+    # has renamed fields before, so the client walks the whole response for the
+    # values it needs. A renamed key then costs a log line, not a broken job.
+
+    @staticmethod
+    def _walk(payload, prefix: str = ""):
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                path = f"{prefix}.{key}" if prefix else str(key)
+                yield path, str(key).lower(), value
+                yield from _VidKrakenClient._walk(value, path)
+        elif isinstance(payload, list):
+            for index, value in enumerate(payload):
+                path = f"{prefix}[{index}]"
+                yield path, prefix.lower(), value
+                yield from _VidKrakenClient._walk(value, path)
+
+    @staticmethod
+    def _number(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if text and text.count(".") < 2 and all(ch in "0123456789." for ch in text):
+                try:
+                    return float(text)
+                except ValueError:
+                    return None
+        return None
+
+    @classmethod
+    def _find_number(cls, payload, tiers) -> float:
+        """First number found under a key matching each tier, in order."""
+        for names in tiers:
+            best = 0.0
+            for _path, key, value in cls._walk(payload):
+                number = cls._number(value)
+                if number is None or not any(name in key for name in names):
+                    continue
+                if 0 < number <= 86400 and number > best:
+                    best = number
+            if best:
+                return best
+        return 0.0
+
+    @classmethod
+    def _find_string(cls, payload, names) -> str | None:
+        for path, key, value in cls._walk(payload):
+            if not isinstance(value, str) or not value.strip():
+                continue
+            if not any(name in key for name in names):
+                continue
+            if any(bad in path.lower() for bad in ("thumbnail", "image", "avatar")):
+                continue
+            return value.strip()
+        return None
+
+    def _find_url(self, payload) -> str | None:
+        """The hosted media link, chosen by scoring every URL in the payload."""
+        tokens = ("downloadurl", "download", "cdn", "fileurl", "mediaurl", "url", "link")
+        scored: list[tuple[int, str]] = []
+        for path, _key, value in self._walk(payload):
+            if not isinstance(value, str) or not value.lower().startswith(("http://", "https://")):
+                continue
+            low = path.lower()
+            if any(bad in low for bad in ("thumbnail", "image", "avatar", "logo", "icon", "docs")):
+                continue
+            score = 0
+            for position, token in enumerate(tokens):
+                if token in low:
+                    score = len(tokens) - position
+                    break
+            scored.append((score, value))
+        return max(scored)[1] if scored else None
+
+    def _status_of(self, payload) -> str:
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if isinstance(status, str) and status.strip():
+            return status.strip().upper()
+        for _path, key, value in self._walk(payload):
+            if not any(word in key for word in ("status", "state", "phase")):
+                continue
+            if isinstance(value, str) and value.strip() and "://" not in value:
+                return value.strip().upper()
+        return ""
+
+    def _ready(self, kind: str, payload) -> bool:
+        """True once a payload carries the answer we asked for, status or not."""
+        if kind == "download":
+            return bool(self._find_url(payload))
+        return bool(self._find_number(payload, _DURATION_TIERS))
+
+    @staticmethod
+    def _job_id(payload: dict) -> str | None:
+        for field in ("jobId", "job_id", "id", "requestId", "taskId"):
+            value = payload.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    @classmethod
+    def describe(cls, payload) -> str:
+        """A compact key/type summary of a response, for the worker log."""
+        parts: list[str] = []
+        for path, _key, value in cls._walk(payload):
+            if path.count(".") > 1 or "[" in path:
+                continue
+            parts.append(f"{path}:{type(value).__name__}")
+            if len(parts) >= 20:
+                break
+        return ", ".join(parts) or "empty response"
 
     def _post(self, path: str, body: dict) -> dict:
         try:
@@ -97,29 +220,38 @@ class _VidKrakenClient:
                 raise self.VidKrakenError(
                     self._message(payload, f"VidKraken returned HTTP {response.status_code}")
                 )
-            status = str(payload.get("status") or "").upper()
+            status = self._status_of(payload)
             if status in self.DONE:
                 return payload
             if status in self.BROKEN:
                 raise self.VidKrakenError(
                     self._message(payload, "VidKraken could not fetch that video.")
                 )
+            if self._ready(kind, payload):
+                # A finished job that hands back its answer without saying so.
+                return payload
             time.sleep(self.POLL_SECONDS)
         raise self.VidKrakenError("VidKraken took too long to prepare that video.")
 
     def info(self, url: str) -> dict:
+        """Video length and title, without queueing a download."""
         started = self._post("info", {"url": url})
-        job_id = started.get("jobId")
+        job_id = self._job_id(started)
         data = self._poll("info", job_id) if job_id else started
-        duration = data.get("duration") or data.get("lengthSeconds") or data.get("durationSeconds")
-        return {"title": data.get("title"), "duration": float(duration or 0), "raw": data}
+        return {
+            "title": self._find_string(data, ("title",)),
+            "duration": self._find_number(data, _DURATION_TIERS),
+            "raw": data,
+        }
 
     def _link(self, payload: dict) -> str:
-        for field in ("downloadUrl", "url", "fileUrl", "cdnUrl", "link"):
-            value = payload.get(field)
-            if isinstance(value, str) and value.startswith("http"):
-                return value
-        raise self.VidKrakenError("VidKraken finished but returned no download link.")
+        link = self._find_url(payload)
+        if not link:
+            raise self.VidKrakenError(
+                "VidKraken finished but its response had no download link "
+                f"({self.describe(payload)})"
+            )
+        return link
 
     def fetch(
         self,
@@ -137,7 +269,7 @@ class _VidKrakenClient:
             body["startTime"] = low
             body["endTime"] = high
         started = self._post("download", body)
-        job_id = started.get("jobId")
+        job_id = self._job_id(started)
         completed = self._poll("download", job_id) if job_id else started
         link = self._link(completed)
         total = 0
@@ -416,15 +548,27 @@ def download_link(url: str, workdir: str, job_id: str,
     everything else, and any failure, falls back to yt-dlp."""
     if _is_youtube(url) and vidkraken.enabled():
         path = os.path.join(workdir, "source.mp4")
+        seen = 0
+
+        def meter(count: int) -> None:
+            # Stop paying for a file we are going to refuse anyway.
+            nonlocal seen
+            seen += count
+            if seen > MAX_BYTES:
+                raise ImportError_(
+                    f"That video is over the {MAX_BYTES // (1024 * 1024)} MB import limit."
+                )
+
         try:
             report(job_id, "downloading", 10)
             if segment_start is not None and segment_end is not None:
                 if segment_end <= segment_start or segment_end - segment_start > MAX_SECONDS:
                     raise ImportError_("That clip range can't be prepared for the editor.")
                 size = vidkraken.fetch(url, vidkraken.QUALITY, path,
-                                       start=float(segment_start), end=float(segment_end))
+                                       start=float(segment_start), end=float(segment_end),
+                                       on_bytes=meter)
             else:
-                size = vidkraken.fetch(url, vidkraken.QUALITY, path)
+                size = vidkraken.fetch(url, vidkraken.QUALITY, path, on_bytes=meter)
             if size > MAX_BYTES:
                 raise ImportError_(
                     f"That video is over the {MAX_BYTES // (1024 * 1024)} MB import limit."
