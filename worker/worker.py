@@ -24,6 +24,7 @@ import numpy as np
 import requests
 
 import importer
+import vidkraken
 
 APP_URL = os.environ.get("APP_URL", "http://localhost:8080").rstrip("/")
 SECRET = os.environ.get("CLIP_WORKER_SECRET", "")
@@ -209,6 +210,8 @@ class JobSource:
         self.used = 0
         self.offset = float((job.get("render_options") or {}).get("window_offset_seconds") or 0)
         self._seen: dict[str, int] = {}
+        # YouTube goes through the paid download service when one is configured.
+        self.kraken = (job.get("platform") or "") == "youtube" and vidkraken.enabled()
 
     # -- set up ----------------------------------------------------------
     def prepare(self) -> None:
@@ -238,7 +241,15 @@ class JobSource:
             self.duration = float(probe(self.local)["format"]["duration"])
             return self.duration, None
 
-        info = self._ladder(lambda _o: None, download=False)
+        info: dict = {}
+        if self.kraken:
+            try:
+                info = vidkraken.info(self.url)
+            except vidkraken.VidKrakenError as exc:
+                print(f"vidkraken info failed, falling back to yt-dlp: {exc}")
+                self.kraken = False
+        if not info:
+            info = self._ladder(lambda _o: None, download=False)
         duration = float(info.get("duration") or 0)
         if duration <= 0:
             raise UserFacingError("We couldn't read that video's length — it may still be live.")
@@ -256,6 +267,15 @@ class JobSource:
         if self.local:
             return self.local
 
+        if self.kraken:
+            path = os.path.join(self.workdir, f"audio-{uuid.uuid4().hex[:8]}.m4a")
+            try:
+                vidkraken.fetch(self.url, "audio", path, on_bytes=self._add_bytes)
+                return path
+            except vidkraken.VidKrakenError as exc:
+                print(f"vidkraken audio failed, falling back to yt-dlp: {exc}")
+                self._drop(path)
+
         def mutate(options: dict) -> None:
             options["outtmpl"] = os.path.join(self.workdir, "audio.%(ext)s")
             options["format"] = AUDIO_FORMAT
@@ -272,6 +292,19 @@ class JobSource:
 
         lo = max(0.0, start - WINDOW_PAD_SECONDS)
         hi = min(self.duration or end + WINDOW_PAD_SECONDS, end + WINDOW_PAD_SECONDS)
+
+        if self.kraken:
+            path = os.path.join(self.workdir, f"window-{uuid.uuid4().hex[:8]}.mp4")
+            trimmed_lo = float(int(lo))
+            try:
+                vidkraken.fetch(
+                    self.url, vidkraken.QUALITY, path,
+                    start=trimmed_lo, end=hi, on_bytes=self._add_bytes,
+                )
+                return path, trimmed_lo
+            except vidkraken.VidKrakenError as exc:
+                print(f"vidkraken window failed, falling back to yt-dlp: {exc}")
+                self._drop(path)
 
         def mutate(options: dict) -> None:
             options["outtmpl"] = os.path.join(self.workdir, "window.%(ext)s")
@@ -329,6 +362,15 @@ class JobSource:
                 raise UserFacingError("That Twitch channel has no videos we can use.")
             info = entries[0]
         return info
+
+    def _add_bytes(self, count: int) -> None:
+        self.used += int(count)
+
+    def _drop(self, path: str) -> None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     def _count_bytes(self, state: dict) -> None:
         """Adds up what actually crossed the metered connection."""
@@ -891,6 +933,7 @@ def main():
     # Ephemeral disk: clear anything a previous container left behind.
     importer.cleanup_orphans()
     check_proxy()
+    print(vidkraken.status_line())
 
     while True:
         # Link imports are short, so they get served before render jobs.
