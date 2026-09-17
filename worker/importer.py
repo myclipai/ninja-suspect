@@ -137,21 +137,39 @@ class _VidKrakenClient:
         return None
 
     def _find_url(self, payload) -> str | None:
-        """The hosted media link, chosen by scoring every URL in the payload."""
-        tokens = ("downloadurl", "download", "cdn", "fileurl", "mediaurl", "url", "link")
+        """The hosted media link, chosen by scoring every URL in the payload.
+
+        The job payload echoes the *source* page URL back at us (and a poll
+        URL), so a bare ``url`` key must never qualify — only keys that name
+        a file, or values that clearly point at a media file, count.
+        """
+        tokens = ("downloadurl", "fileurl", "mediaurl", "media", "cdn", "download", "link")
+        bad_keys = ("thumbnail", "image", "avatar", "logo", "icon", "docs", "poll", "webpage", "source")
+        source_hosts = ("youtube.com", "youtu.be", "googlevideo.com", "tiktok.com", "twitch.tv", "kick.com")
+        media_exts = (".mp4", ".m4a", ".webm", ".mp3", ".mkv", ".mov", ".aac", ".opus", ".wav")
         scored: list[tuple[int, str]] = []
         for path, _key, value in self._walk(payload):
             if not isinstance(value, str) or not value.lower().startswith(("http://", "https://")):
                 continue
             low = path.lower()
-            if any(bad in low for bad in ("thumbnail", "image", "avatar", "logo", "icon", "docs")):
+            low_value = value.lower()
+            if any(bad in low for bad in bad_keys):
                 continue
+            host = low_value.split("/", 3)[2] if "://" in low_value else ""
+            if any(bad_host in host for bad_host in source_hosts):
+                continue
+            if "vidkraken.com" in host and "/api/" in low_value:
+                continue  # the poll endpoint, not a file
             score = 0
             for position, token in enumerate(tokens):
                 if token in low:
                     score = len(tokens) - position
                     break
-            scored.append((score, value))
+            else:
+                if low_value.split("?")[0].endswith(media_exts):
+                    score = 1
+            if score:
+                scored.append((score, value))
         return max(scored)[1] if scored else None
 
     def _status_of(self, payload) -> str:
