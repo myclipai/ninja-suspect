@@ -23,6 +23,8 @@ from urllib.parse import urlsplit
 
 import requests
 
+import vidkraken
+
 APP_URL = os.environ.get("APP_URL", "http://localhost:8080").rstrip("/")
 SECRET = os.environ.get("CLIP_WORKER_SECRET", "")
 HEADERS = {"x-worker-secret": SECRET}
@@ -245,6 +247,39 @@ def download_public(url: str, workdir: str, job_id: str,
     raise ImportError_("The video downloaded but no file was produced.")
 
 
+def download_link(url: str, workdir: str, job_id: str,
+                  segment_start: float | None = None,
+                  segment_end: float | None = None) -> str:
+    """YouTube goes through the paid download service when one is configured;
+    everything else, and any failure, falls back to yt-dlp."""
+    if _is_youtube(url) and vidkraken.enabled():
+        path = os.path.join(workdir, "source.mp4")
+        try:
+            report(job_id, "downloading", 10)
+            if segment_start is not None and segment_end is not None:
+                if segment_end <= segment_start or segment_end - segment_start > MAX_SECONDS:
+                    raise ImportError_("That clip range can't be prepared for the editor.")
+                size = vidkraken.fetch(url, vidkraken.QUALITY, path,
+                                       start=float(segment_start), end=float(segment_end))
+            else:
+                size = vidkraken.fetch(url, vidkraken.QUALITY, path)
+            if size > MAX_BYTES:
+                raise ImportError_(
+                    f"That video is over the {MAX_BYTES // (1024 * 1024)} MB import limit."
+                )
+            report(job_id, "downloading", 78)
+            return path
+        except ImportError_:
+            raise
+        except vidkraken.VidKrakenError as exc:
+            print(f"vidkraken import failed, falling back to yt-dlp: {exc}")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return download_public(url, workdir, job_id, segment_start, segment_end)
+
+
 def upload(path: str, upload_url: str) -> None:
     with open(path, "rb") as fh:
         resp = requests.put(
@@ -298,7 +333,7 @@ def process_import(job: dict) -> None:
                         fh.write(chunk)
             path = original
         else:
-            path = download_public(job["url"], workdir, job_id, segment_start, segment_end)
+            path = download_link(job["url"], workdir, job_id, segment_start, segment_end)
 
         if direct and segment_start is not None and segment_end is not None:
             trimmed = os.path.join(workdir, "source-segment.mp4")
