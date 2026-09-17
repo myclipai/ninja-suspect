@@ -335,6 +335,13 @@ class JobSource:
                     with_cookies["cookiefile"] = base["cookiefile"]
                     variants.append(with_cookies)
 
+        # A dead, expired or unpaid proxy must not stop a download that can
+        # still go out directly: retry every variant with the proxy removed.
+        if base.get("proxy"):
+            variants.extend(
+                {k: v for k, v in variant.items() if k != "proxy"} for variant in list(variants)
+            )
+
         last: Exception | None = None
         for index, options in enumerate(variants):
             if index:
