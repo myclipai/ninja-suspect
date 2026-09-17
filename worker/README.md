@@ -17,7 +17,10 @@ Nothing here fakes progress.
 | `APP_URL` | yes | Base URL of the app, e.g. `https://myclipai.com` |
 | `CLIP_WORKER_SECRET` | yes | Shared secret; must match the app's secret |
 | `LOVABLE_API_KEY` | no | Only if you call the AI directly; the app normally does it |
-| `YOUTUBE_COOKIES_B64` | no | Base64 of a Netscape cookies file; needed for YouTube |
+| `VIDKRAKEN_API_KEY` | recommended | Vid Kraken key; handles all YouTube downloads (metadata, audio, trimmed windows) |
+| `VIDKRAKEN_FORMAT` | no | Picture quality asked of Vid Kraken: `1080` (default), `720`, `480`, `360` |
+| `DOWNLOAD_PROXY` | no | Only used when no Vid Kraken key is set; residential proxy for yt-dlp |
+| `YOUTUBE_COOKIES_B64` | no | Base64 of a Netscape cookies file; only used by the yt-dlp fallback |
 | `WHISPER_MODEL` | no | `tiny`…`large-v3` (default `small`) |
 | `MAX_SOURCE_SECONDS` | no | Longest source video accepted (default 4 hours) |
 | `POLL_SECONDS` | no | Seconds between polls when idle (default 5) |
