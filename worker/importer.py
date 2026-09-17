@@ -279,11 +279,17 @@ class _VidKrakenClient:
         link = self._link(completed)
         total = 0
         last_status = 0
-        for attempt in range(4):
+        last_detail = ""
+        attempts = 6
+        for attempt in range(attempts):
+            # Alternate between sending the API key and a plain fetch: some
+            # CDN edges reject unexpected Authorization headers, while the
+            # documented behaviour is that the key is required everywhere.
+            headers = self._download_headers() if attempt % 2 == 0 else {"Accept": "*/*"}
             try:
                 with requests.get(
                     link,
-                    headers=self._download_headers(),
+                    headers=headers,
                     stream=True,
                     timeout=1800,
                 ) as response:
@@ -298,26 +304,37 @@ class _VidKrakenClient:
                                 if on_bytes:
                                     on_bytes(len(chunk))
                         break
+                    # Capture a short body snippet so failures are diagnosable
+                    # from the job error alone (no server-log access needed).
+                    try:
+                        snippet = response.content[:300].decode("utf-8", "replace").strip()
+                    except Exception:
+                        snippet = ""
+                    retry_hint = response.headers.get("Retry-After", "")
+                    last_detail = (
+                        f"HTTP {response.status_code}"
+                        + (f", Retry-After: {retry_hint}" if retry_hint else "")
+                        + (f" — {snippet}" if snippet else "")
+                    )
                     if response.status_code != 429 and response.status_code < 500:
                         raise self.VidKrakenError(
-                            f"The prepared file couldn't be read (HTTP {response.status_code})."
+                            f"The prepared file couldn't be read ({last_detail})."
                         )
-                    retry_after = response.headers.get("Retry-After", "")
                     try:
-                        wait = max(1.0, min(float(retry_after), 30.0))
+                        wait = max(2.0, min(float(retry_hint), 60.0))
                     except ValueError:
-                        wait = min(2 ** attempt, 15)
+                        wait = min(5 * (attempt + 1), 45)
             except requests.RequestException as exc:
-                if attempt == 3:
+                if attempt == attempts - 1:
                     raise self.VidKrakenError(
                         f"The prepared file couldn't be downloaded: {exc}"
                     ) from exc
-                wait = min(2 ** attempt, 15)
-            if attempt < 3:
+                wait = min(5 * (attempt + 1), 45)
+            if attempt < attempts - 1:
                 time.sleep(wait)
         if total == 0 and last_status:
             raise self.VidKrakenError(
-                f"The prepared file couldn't be read after retrying (HTTP {last_status})."
+                f"The prepared file couldn't be read after retrying ({last_detail or f'HTTP {last_status}'})."
             )
         if total == 0:
             raise self.VidKrakenError("The prepared file was empty.")
