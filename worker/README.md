@@ -22,7 +22,8 @@ Nothing here fakes progress.
 | `DOWNLOAD_PROXY` | no | Only used when no Vid Kraken key is set; residential proxy for yt-dlp |
 | `YOUTUBE_COOKIES_B64` | no | Base64 of a Netscape cookies file; only used by the yt-dlp fallback |
 | `WHISPER_MODEL` | no | `tiny`…`large-v3` (default `small`) |
-| `MAX_SOURCE_SECONDS` | no | Longest source video accepted (default 4 hours) |
+| `MAX_SOURCE_SECONDS` | no | Longest source video accepted (default 5400 = 90 minutes) |
+| `MAX_AUDIO_BYTES` | no | Stops a sound-track download once it passes this size (default 160 MB) |
 | `POLL_SECONDS` | no | Seconds between polls when idle (default 5) |
 
 ## Run it on Railway (recommended)
