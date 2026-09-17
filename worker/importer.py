@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import glob
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -23,7 +24,161 @@ from urllib.parse import urlsplit
 
 import requests
 
-import vidkraken
+
+class _VidKrakenError(Exception):
+    """A VidKraken failure that permits the existing yt-dlp fallback."""
+
+
+class _VidKrakenClient:
+    """Self-contained VidKraken client.
+
+    This intentionally lives in importer.py because older Railway build
+    recipes copied only importer.py and worker.py into the image. Keeping the
+    client here prevents a missing helper file from crashing the container.
+    """
+
+    VidKrakenError = _VidKrakenError
+    BASE = os.environ.get("VIDKRAKEN_API_URL", "https://vidkraken.com/api/v2").rstrip("/")
+    QUALITY = os.environ.get("VIDKRAKEN_FORMAT", "1080")
+    POLL_SECONDS = float(os.environ.get("VIDKRAKEN_POLL_SECONDS", 3))
+    JOB_TIMEOUT = float(os.environ.get("VIDKRAKEN_TIMEOUT_SECONDS", 1800))
+    DONE = {"COMPLETED", "COMPLETE", "SUCCESS", "SUCCEEDED", "DONE", "READY", "FINISHED"}
+    BROKEN = {"FAILED", "ERROR", "CANCELLED", "CANCELED"}
+
+    @staticmethod
+    def key() -> str:
+        return os.environ.get("VIDKRAKEN_API_KEY", "").strip()
+
+    def enabled(self) -> bool:
+        return bool(self.key())
+
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.key()}", "Content-Type": "application/json"}
+
+    @staticmethod
+    def _message(payload: dict, fallback: str) -> str:
+        for field in ("error", "message", "errorMessage", "failureReason"):
+            value = payload.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return fallback
+
+    def _post(self, path: str, body: dict) -> dict:
+        try:
+            response = requests.post(
+                f"{self.BASE}/{path}", headers=self._headers(), json=body, timeout=60
+            )
+        except requests.RequestException as exc:
+            raise self.VidKrakenError(f"VidKraken is unreachable: {exc}") from exc
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        if not response.ok:
+            raise self.VidKrakenError(
+                self._message(payload, f"VidKraken returned HTTP {response.status_code}")
+            )
+        return payload
+
+    def _poll(self, kind: str, job_id: str) -> dict:
+        deadline = time.time() + self.JOB_TIMEOUT
+        while time.time() < deadline:
+            try:
+                response = requests.get(
+                    f"{self.BASE}/{kind}/{job_id}", headers=self._headers(), timeout=60
+                )
+            except requests.RequestException as exc:
+                raise self.VidKrakenError(f"VidKraken is unreachable: {exc}") from exc
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            if not response.ok:
+                raise self.VidKrakenError(
+                    self._message(payload, f"VidKraken returned HTTP {response.status_code}")
+                )
+            status = str(payload.get("status") or "").upper()
+            if status in self.DONE:
+                return payload
+            if status in self.BROKEN:
+                raise self.VidKrakenError(
+                    self._message(payload, "VidKraken could not fetch that video.")
+                )
+            time.sleep(self.POLL_SECONDS)
+        raise self.VidKrakenError("VidKraken took too long to prepare that video.")
+
+    def info(self, url: str) -> dict:
+        started = self._post("info", {"url": url})
+        job_id = started.get("jobId")
+        data = self._poll("info", job_id) if job_id else started
+        duration = data.get("duration") or data.get("lengthSeconds") or data.get("durationSeconds")
+        return {"title": data.get("title"), "duration": float(duration or 0), "raw": data}
+
+    def _link(self, payload: dict) -> str:
+        for field in ("downloadUrl", "url", "fileUrl", "cdnUrl", "link"):
+            value = payload.get(field)
+            if isinstance(value, str) and value.startswith("http"):
+                return value
+        raise self.VidKrakenError("VidKraken finished but returned no download link.")
+
+    def fetch(
+        self,
+        url: str,
+        fmt: str,
+        path: str,
+        start: float | None = None,
+        end: float | None = None,
+        on_bytes=None,
+    ) -> int:
+        body: dict = {"url": url, "format": fmt}
+        if start is not None and end is not None:
+            low = max(0, int(math.floor(start)))
+            high = max(low + 1, int(math.ceil(end)))
+            body["startTime"] = low
+            body["endTime"] = high
+        started = self._post("download", body)
+        job_id = started.get("jobId")
+        completed = self._poll("download", job_id) if job_id else started
+        link = self._link(completed)
+        total = 0
+        try:
+            with requests.get(link, stream=True, timeout=1800) as response:
+                if not response.ok:
+                    raise self.VidKrakenError(
+                        f"The prepared file couldn't be read (HTTP {response.status_code})."
+                    )
+                with open(path, "wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+                        total += len(chunk)
+                        if on_bytes:
+                            on_bytes(len(chunk))
+        except requests.RequestException as exc:
+            raise self.VidKrakenError(
+                f"The prepared file couldn't be downloaded: {exc}"
+            ) from exc
+        if total == 0:
+            raise self.VidKrakenError("The prepared file was empty.")
+        return total
+
+    def status_line(self) -> str:
+        if not self.enabled():
+            return "vidkraken: no API key set, falling back to yt-dlp for YouTube"
+        try:
+            response = requests.get(f"{self.BASE}/me", headers=self._headers(), timeout=30)
+            if response.ok:
+                return f"vidkraken: connected ({response.text[:200]})"
+            return (
+                f"vidkraken: key rejected (HTTP {response.status_code}). "
+                "Check VIDKRAKEN_API_KEY."
+            )
+        except requests.RequestException as exc:
+            return f"vidkraken: unreachable - {exc}"
+
+
+vidkraken = _VidKrakenClient()
 
 APP_URL = os.environ.get("APP_URL", "http://localhost:8080").rstrip("/")
 SECRET = os.environ.get("CLIP_WORKER_SECRET", "")
