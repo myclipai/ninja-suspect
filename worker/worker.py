@@ -24,7 +24,10 @@ import numpy as np
 import requests
 
 import importer
-import vidkraken
+
+# The download client is embedded in importer.py so the worker remains
+# compatible with older Railway images that only copy these two Python files.
+vidkraken = importer.vidkraken
 
 APP_URL = os.environ.get("APP_URL", "http://localhost:8080").rstrip("/")
 SECRET = os.environ.get("CLIP_WORKER_SECRET", "")
