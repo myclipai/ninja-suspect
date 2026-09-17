@@ -219,7 +219,13 @@ class JobSource:
         self._seen: dict[str, int] = {}
         self._audio: str | None = None
         # YouTube goes through the paid download service when one is configured.
-        self.kraken = (job.get("platform") or "") == "youtube" and vidkraken.enabled()
+        # Detect YouTube from the source URL as well as the stored label. This
+        # keeps VidKraken enabled for older jobs whose platform value is absent
+        # or uses different casing.
+        platform = (job.get("platform") or "").lower()
+        self.kraken = (platform == "youtube" or importer._is_youtube(self.url)) and vidkraken.enabled()
+        # Why the paid download service didn't deliver, if it was tried at all.
+        self.kraken_note: str | None = None
 
     # -- set up ----------------------------------------------------------
     def prepare(self) -> None:
@@ -257,6 +263,7 @@ class JobSource:
             try:
                 info = vidkraken.info(self.url)
             except vidkraken.VidKrakenError as exc:
+                self.kraken_note = str(exc)
                 print(f"vidkraken info failed, reading the length off the audio instead: {exc}")
                 return 0.0, None
             title = info.get("title")
@@ -312,6 +319,7 @@ class JobSource:
                 self._audio = path
                 return path
             except vidkraken.VidKrakenError as exc:
+                self.kraken_note = str(exc)
                 print(f"vidkraken audio failed, falling back to yt-dlp: {exc}")
                 self._drop(path)
 
@@ -352,6 +360,7 @@ class JobSource:
                 )
                 return path, trimmed_lo
             except vidkraken.VidKrakenError as exc:
+                self.kraken_note = str(exc)
                 print(f"vidkraken window failed, falling back to yt-dlp: {exc}")
                 self._drop(path)
 
@@ -402,9 +411,20 @@ class JobSource:
                 return self._run(options, download)
             except Exception as exc:  # noqa: BLE001 - the message is shown to the user
                 last = exc
-        raise UserFacingError(
-            twitch_friendly_error(str(last), self.job.get("platform") or "")
-        ) from last
+        platform = self.job.get("platform") or ""
+        message = twitch_friendly_error(str(last), platform)
+        if platform == "youtube":
+            # Direct downloads are only a backstop: when they fail, the real
+            # story is almost always the download service being off or unpaid.
+            if not vidkraken.enabled():
+                message = (
+                    "The video download service isn't switched on for the render machine, "
+                    "so YouTube links can't be downloaded. Add the download service key and "
+                    "redeploy."
+                )
+            elif self.kraken_note:
+                message = f"The video download service couldn't fetch that link: {self.kraken_note[:200]}"
+        raise UserFacingError(message) from last
 
     def _run(self, options: dict, download: bool) -> dict:
         import yt_dlp
