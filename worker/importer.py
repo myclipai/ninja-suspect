@@ -222,6 +222,13 @@ def download_public(url: str, workdir: str, job_id: str,
             with_cookies["cookiefile"] = opts["cookiefile"]
             attempts.append(with_cookies)
 
+    # A dead, expired or unpaid proxy must not stop a download that can still
+    # go out directly: retry every variant with the proxy removed.
+    if opts.get("proxy"):
+        attempts.extend(
+            {k: v for k, v in variant.items() if k != "proxy"} for variant in list(attempts)
+        )
+
     last_error: Exception | None = None
     for options in attempts:
         try:
