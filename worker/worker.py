@@ -976,9 +976,11 @@ def process(job: dict):
         print(f"job {job_id} cancelled by the user")
     except UserFacingError as exc:
         finish(job_id, "failed", str(exc), downloaded_bytes=source.used)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         print(traceback.format_exc())
-        finish(job_id, "failed", "Something went wrong while processing this video. Please try again.",
+        detail = str(exc).strip().splitlines()[-1][:300] if str(exc).strip() else type(exc).__name__
+        finish(job_id, "failed",
+               f"Something went wrong while processing this video ({detail}). Please try again.",
                downloaded_bytes=source.used)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
